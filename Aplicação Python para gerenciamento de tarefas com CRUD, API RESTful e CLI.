@@ -1,0 +1,196 @@
+import sqlite3
+import threading
+import time
+import argparse
+import logging
+import asyncio
+from flask import Flask, jsonify, request
+import datetime
+import random
+
+# Conf do logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Ini do banco de dados SQLite
+def init_db():
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logging.info("Banco de dados inicializado.")
+
+
+class Task:
+    def __init__(self, id, title, description, status, created_at):
+        self.id = id
+        self.title = title
+        self.description = description
+        self.status = status
+        self.created_at = created_at
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "status": self.status,
+            "created_at": self.created_at
+        }
+
+# Classe para gerenciar as operações CRUD das tarefas
+class TaskManager:
+    def __init__(self, db_file='tasks.db'):
+        self.db_file = db_file
+    
+    def add_task(self, title, description):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("INSERT INTO tasks (title, description) VALUES (?, ?)", (title, description))
+        conn.commit()
+        task_id = c.lastrowid
+        conn.close()
+        logging.info(f"Tarefa adicionada: {title}")
+        return task_id
+    
+    def list_tasks(self):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks")
+        rows = c.fetchall()
+        conn.close()
+        tasks = [Task(*row) for row in rows]
+        return tasks
+
+    def get_task(self, task_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return Task(*row)
+        return None
+    
+    def update_task_status(self, task_id, status):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        conn.commit()
+        conn.close()
+        logging.info(f"Tarefa {task_id} atualizada para {status}")
+    
+    def delete_task(self, task_id):
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
+        logging.info(f"Tarefa {task_id} removida")
+
+# Conf do Flask para API REST
+app = Flask(__name__)
+task_manager = TaskManager()
+
+@app.route('/api/tasks', methods=['GET'])
+def api_list_tasks():
+    tasks = task_manager.list_tasks()
+    return jsonify([task.to_dict() for task in tasks])
+
+@app.route('/api/tasks', methods=['POST'])
+def api_add_task():
+    data = request.json
+    title = data.get("title")
+    description = data.get("description", "")
+    if not title:
+        return jsonify({"error": "Título é obrigatório"}), 400
+    task_id = task_manager.add_task(title, description)
+    return jsonify({"message": "Tarefa adicionada", "task_id": task_id}), 201
+
+@app.route('/api/tasks/<int:task_id>', methods=['PUT'])
+def api_update_task(task_id):
+    data = request.json
+    status = data.get("status")
+    if not status:
+        return jsonify({"error": "Status é obrigatório"}), 400
+    task_manager.update_task_status(task_id, status)
+    return jsonify({"message": "Tarefa atualizada"})
+
+@app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
+def api_delete_task(task_id):
+    task_manager.delete_task(task_id)
+    return jsonify({"message": "Tarefa removida"})
+
+# Função para agen de tarefas em background usando threading
+def background_scheduler():
+    while True:
+        tasks = task_manager.list_tasks()
+        # Atualiza aleatoriamente tarefas pendentes para "completed"
+        for task in tasks:
+            if task.status == "pending" and random.choice([True, False, False]):
+                task_manager.update_task_status(task.id, "completed")
+                logging.debug(f"Tarefa {task.id} concluída automaticamente")
+        time.sleep(10)  # Aguarda 10 segundos antes de repetir
+
+# Ex de função assíncrona com asyncio
+async def async_task():
+    while True:
+        logging.debug("Executando tarefa assíncrona...")
+        await asyncio.sleep(5)
+
+# Função para ini o servidor Flask em uma thread separada
+def run_flask():
+    app.run(port=5000)
+
+# Interface de linha de comando (CLI)
+def main():
+    parser = argparse.ArgumentParser(description="Sistema de Gerenciamento de Tarefas")
+    parser.add_argument('--add', nargs=2, metavar=('TITLE', 'DESCRIPTION'), help="Adicionar nova tarefa")
+    parser.add_argument('--list', action='store_true', help="Listar todas as tarefas")
+    parser.add_argument('--delete', type=int, metavar='TASK_ID', help="Remover tarefa pelo ID")
+    parser.add_argument('--update', nargs=2, metavar=('TASK_ID', 'STATUS'), help="Atualizar status da tarefa")
+    parser.add_argument('--runserver', action='store_true', help="Rodar servidor web API")
+    args = parser.parse_args()
+
+    if args.add:
+        title, description = args.add
+        task_id = task_manager.add_task(title, description)
+        print(f"Tarefa adicionada com ID: {task_id}")
+    elif args.list:
+        tasks = task_manager.list_tasks()
+        for task in tasks:
+            print(task.to_dict())
+    elif args.delete:
+        task_manager.delete_task(args.delete)
+        print(f"Tarefa {args.delete} removida")
+    elif args.update:
+        task_id, status = args.update
+        try:
+            task_id = int(task_id)
+        except ValueError:
+            print("ID inválido")
+            return
+        task_manager.update_task_status(task_id, status)
+        print(f"Tarefa {task_id} atualizada para {status}")
+    elif args.runserver:
+        # Inicia o agendador em background
+        threading.Thread(target=background_scheduler, daemon=True).start()
+        # Executa a tarefa assíncrona
+        loop = asyncio.get_event_loop()
+        loop.create_task(async_task())
+        # Roda o servidor Flask (bloqueante)
+        run_flask()
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    init_db()
+    main()
